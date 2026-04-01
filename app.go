@@ -53,6 +53,7 @@ type RepoVersionSource struct {
 // RepoPreferences stores branch selection/favorites for one repository.
 type RepoPreferences struct {
 	VersionFile       string              `json:"versionFile,omitempty"`
+	BranchScope       string              `json:"branchScope,omitempty"`
 	SelectedBranches  []string            `json:"selectedBranches"`
 	FavoriteBranches  []string            `json:"favoriteBranches"`
 	BranchTypes       map[string]string   `json:"branchTypes"`
@@ -94,6 +95,12 @@ type PatternPreview struct {
 	Extracted string `json:"extracted"`
 	Formatted string `json:"formatted"`
 	Message   string `json:"message"`
+}
+
+type versionCandidate struct {
+	Label    string
+	Original string
+	Token    string
 }
 
 // NewApp creates a new App application struct
@@ -332,22 +339,107 @@ func (a *App) GetRepoPath() string {
 
 // GetBranches returns the list of local branch names for the configured repository.
 func (a *App) GetBranches() ([]string, error) {
+	return a.getBranchesByMode("all")
+}
+
+// GetBranchesWithMode returns branches according to scope: local, all, or remote.
+func (a *App) GetBranchesWithMode(mode string) ([]string, error) {
+	return a.getBranchesByMode(mode)
+}
+
+func (a *App) getBranchesByMode(mode string) ([]string, error) {
 	if a.repoPath == "" {
 		return nil, fmt.Errorf("no repository configured")
 	}
-	cmd := gitCommand("-C", a.repoPath, "branch", "--format=%(refname:short)")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to list branches: %w", err)
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	includeLocal := mode == "" || mode == "all" || mode == "local"
+	includeRemote := mode == "" || mode == "all" || mode == "remote"
+	if !includeLocal && !includeRemote {
+		includeLocal = true
+		includeRemote = true
 	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	var branches []string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			branches = append(branches, line)
+
+	// Best effort refresh of remote-tracking refs; failures are ignored to support offline usage.
+	if includeRemote {
+		_ = gitCommand("-C", a.repoPath, "fetch", "--all", "--prune").Run()
+	}
+
+	branches := make([]string, 0)
+	seen := map[string]struct{}{}
+	addBranch := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		branches = append(branches, name)
+	}
+
+	if includeLocal {
+		localCmd := gitCommand("-C", a.repoPath, "branch", "--format=%(refname:short)")
+		localOut, err := localCmd.Output()
+		if err != nil {
+			return nil, fmt.Errorf("failed to list local branches: %w", err)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(localOut)), "\n") {
+			branch := strings.TrimSpace(line)
+			addBranch(branch)
 		}
 	}
+
+	if includeRemote {
+		remoteCmd := gitCommand("-C", a.repoPath, "branch", "-r", "--format=%(refname:short)")
+		remoteOut, err := remoteCmd.Output()
+		if err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(remoteOut)), "\n") {
+				remoteRef := strings.TrimSpace(line)
+				if remoteRef == "" || strings.HasSuffix(remoteRef, "/HEAD") {
+					continue
+				}
+				addBranch(remoteRef)
+			}
+		}
+
+		// Query remotes directly too, in case tracking refs are stale/missing locally.
+		remotesCmd := gitCommand("-C", a.repoPath, "remote")
+		remotesOut, err := remotesCmd.Output()
+		if err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(remotesOut)), "\n") {
+				remoteName := strings.TrimSpace(line)
+				if remoteName == "" {
+					continue
+				}
+				lsCmd := gitCommand("-C", a.repoPath, "ls-remote", "--heads", remoteName)
+				lsOut, lsErr := lsCmd.Output()
+				if lsErr != nil {
+					continue
+				}
+				for _, headLine := range strings.Split(strings.TrimSpace(string(lsOut)), "\n") {
+					headLine = strings.TrimSpace(headLine)
+					if headLine == "" {
+						continue
+					}
+					parts := strings.Fields(headLine)
+					if len(parts) < 2 {
+						continue
+					}
+					ref := parts[1]
+					const prefix = "refs/heads/"
+					if !strings.HasPrefix(ref, prefix) {
+						continue
+					}
+					branchName := strings.TrimPrefix(ref, prefix)
+					addBranch(remoteName + "/" + branchName)
+				}
+			}
+		}
+	}
+
+	sort.Strings(branches)
 	return branches, nil
 }
 
@@ -365,7 +457,7 @@ func (a *App) GetBranchVersions(versionFile string, selectedBranches []string) (
 		Name:     filepath.Base(versionFile),
 		FilePath: versionFile,
 	}
-	grouped, err := a.GetBranchGroupedVersions([]RepoVersionSource{source}, selectedBranches, nil)
+	grouped, err := a.GetBranchGroupedVersions([]RepoVersionSource{source}, selectedBranches, nil, 1, true)
 	if err != nil {
 		return nil, err
 	}
@@ -381,7 +473,7 @@ func (a *App) GetBranchVersions(versionFile string, selectedBranches []string) (
 }
 
 // GetBranchGroupedVersions returns extracted values grouped by branch.
-func (a *App) GetBranchGroupedVersions(sources []RepoVersionSource, selectedBranches []string, branchTypes map[string]string) ([]BranchGroupedResult, error) {
+func (a *App) GetBranchGroupedVersions(sources []RepoVersionSource, selectedBranches []string, branchTypes map[string]string, incrementStep int, applyIncrement bool) ([]BranchGroupedResult, error) {
 	if a.repoPath == "" {
 		return nil, fmt.Errorf("no repository configured")
 	}
@@ -401,16 +493,24 @@ func (a *App) GetBranchGroupedVersions(sources []RepoVersionSource, selectedBran
 	results := make([]BranchGroupedResult, 0, len(branches))
 	for _, branch := range branches {
 		row := BranchGroupedResult{Branch: branch, Items: []BranchSourceValue{}}
-		branchType := normalizedBranchType(branchTypes[branch])
+		_ = branchTypes
 		for _, source := range sources {
 			value := "no-version"
 			if strings.TrimSpace(source.FilePath) != "" {
 				content, err := a.readFileFromBranch(branch, source.FilePath)
 				if err == nil {
-					extracted := extractWithPattern(content, source.Pattern)
-					formatted := formatVersionOutput(extracted, branchType)
-					if formatted != "" {
-						value = formatted
+					candidates := detectVersionCandidates(content, source.Pattern)
+					if len(candidates) > 0 {
+						lines := make([]string, 0, len(candidates))
+						for _, candidate := range candidates {
+							formatted := formatCandidate(candidate, incrementStep, applyIncrement)
+							if formatted != "" {
+								lines = append(lines, formatted)
+							}
+						}
+						if len(lines) > 0 {
+							value = strings.Join(lines, "\n")
+						}
 					}
 				}
 			}
@@ -457,27 +557,28 @@ func (a *App) PreviewVersionPatternInBranch(filePath string, pattern string, bra
 	if err != nil {
 		return PatternPreview{Status: "file-not-found", Message: "File not found in selected branch"}, nil
 	}
-
-	extracted := extractWithPattern(content, pattern)
-	if extracted == "INVALID_PATTERN" {
-		return PatternPreview{Status: "invalid-pattern", Message: "Invalid regex pattern"}, nil
-	}
-	if strings.TrimSpace(extracted) == "" {
+	candidates := detectVersionCandidates(content, pattern)
+	if len(candidates) == 0 {
+		if strings.TrimSpace(pattern) != "" {
+			if extractWithPattern(content, pattern) == "INVALID_PATTERN" {
+				return PatternPreview{Status: "invalid-pattern", Message: "Invalid regex pattern"}, nil
+			}
+		}
 		return PatternPreview{Status: "no-version", Message: "Version not detected"}, nil
 	}
-
-	formatted := formatVersionOutput(extracted, branchType)
+	first := candidates[0]
+	formatted := formatVersionOutput(first.Original, branchType, 1, true)
 	if formatted == "no-version" {
 		return PatternPreview{
 			Status:    "no-version",
-			Extracted: extracted,
+			Extracted: first.Original,
 			Message:   "Could not format next version from extracted value",
 		}, nil
 	}
 
 	return PatternPreview{
 		Status:    "ok",
-		Extracted: extracted,
+		Extracted: first.Original,
 		Formatted: formatted,
 		Message:   fmt.Sprintf("Preview from branch %s", branch),
 	}, nil
@@ -579,35 +680,34 @@ func firstLine(content string) string {
 	return line
 }
 
-func formatVersionOutput(rawValue, branchType string) string {
+func formatVersionOutput(rawValue, branchType string, incrementStep int, applyIncrement bool) string {
 	rawValue = strings.TrimSpace(rawValue)
 	if rawValue == "" || rawValue == "INVALID_PATTERN" {
 		return "no-version"
 	}
-
-	original, next, ok := computeNextVersion(rawValue, branchType)
+	original, next, ok := computeNextVersion(rawValue, branchType, incrementStep, applyIncrement)
 	if !ok {
 		return "no-version"
+	}
+	if !applyIncrement {
+		return original
 	}
 	return fmt.Sprintf("%s -> %s", original, next)
 }
 
-func computeNextVersion(rawValue, branchType string) (string, string, bool) {
-	re := regexp.MustCompile(`\d+(?:\.\d+){3,4}`)
+func computeNextVersion(rawValue, branchType string, incrementStep int, applyIncrement bool) (string, string, bool) {
+	_ = branchType
+	re := regexp.MustCompile(`\d+(?:\.\d+)+`)
 	token := re.FindString(rawValue)
 	if token == "" {
 		return "", "", false
 	}
 
 	parts := strings.Split(token, ".")
-	if len(parts) < 4 {
+	if len(parts) < 2 {
 		return "", "", false
 	}
-
-	count := expectedPartsForBranch(branchType, len(parts))
-	if count == 0 || len(parts) < count {
-		return "", "", false
-	}
+	count := len(parts)
 	parts = append([]string{}, parts[:count]...)
 
 	widths := make([]int, count)
@@ -633,9 +733,125 @@ func computeNextVersion(rawValue, branchType string) (string, string, bool) {
 	}
 
 	original := formatParts(numbers, widths)
-	numbers[count-1]++
+	if incrementStep < 1 {
+		incrementStep = 1
+	}
+	if applyIncrement {
+		numbers[count-1] += incrementStep
+	}
 	next := formatParts(numbers, widths)
 	return original, next, true
+}
+
+func formatCandidate(candidate versionCandidate, incrementStep int, applyIncrement bool) string {
+	formatted := formatVersionOutput(candidate.Original, "auto", incrementStep, applyIncrement)
+	if formatted == "no-version" {
+		return ""
+	}
+	if candidate.Label == "" {
+		return formatted
+	}
+	return fmt.Sprintf("%s: %s", candidate.Label, formatted)
+}
+
+func detectVersionCandidates(content, pattern string) []versionCandidate {
+	pattern = strings.TrimSpace(pattern)
+	if pattern != "" {
+		value := extractWithPattern(content, pattern)
+		if value == "" || value == "INVALID_PATTERN" {
+			return nil
+		}
+		return []versionCandidate{{Label: "match", Original: value, Token: value}}
+	}
+
+	var root interface{}
+	if err := json.Unmarshal([]byte(content), &root); err == nil {
+		var candidates []versionCandidate
+		collectJSONVersionCandidates(root, "", &candidates)
+		if len(candidates) > 0 {
+			return dedupeCandidates(candidates)
+		}
+	}
+
+	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	var candidates []versionCandidate
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if token := findVersionToken(line); token != "" {
+			candidates = append(candidates, versionCandidate{
+				Label:    fmt.Sprintf("line %d", i+1),
+				Original: line,
+				Token:    token,
+			})
+		}
+	}
+	return dedupeCandidates(candidates)
+}
+
+func collectJSONVersionCandidates(node interface{}, path string, out *[]versionCandidate) {
+	switch typed := node.(type) {
+	case map[string]interface{}:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			nextPath := key
+			if path != "" {
+				nextPath = path + "." + key
+			}
+			collectJSONVersionCandidates(typed[key], nextPath, out)
+		}
+	case []interface{}:
+		for i, value := range typed {
+			nextPath := fmt.Sprintf("%s[%d]", path, i)
+			collectJSONVersionCandidates(value, nextPath, out)
+		}
+	case string:
+		token := findVersionToken(typed)
+		if token == "" {
+			return
+		}
+		label := path
+		if dot := strings.LastIndex(label, "."); dot >= 0 {
+			label = label[dot+1:]
+		}
+		label = strings.TrimSpace(label)
+		if label == "" {
+			label = "value"
+		}
+		*out = append(*out, versionCandidate{
+			Label:    label,
+			Original: strings.TrimSpace(typed),
+			Token:    token,
+		})
+	}
+}
+
+func findVersionToken(text string) string {
+	versionToken := regexp.MustCompile(`\d+(?:\.\d+)+`)
+	return strings.TrimSpace(versionToken.FindString(text))
+}
+
+func dedupeCandidates(values []versionCandidate) []versionCandidate {
+	seen := map[string]struct{}{}
+	result := make([]versionCandidate, 0, len(values))
+	for _, value := range values {
+		key := strings.ToLower(strings.TrimSpace(value.Label) + "|" + strings.TrimSpace(value.Original))
+		if key == "|" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func formatParts(values []int, widths []int) string {
@@ -893,6 +1109,7 @@ func uniqueSources(values []RepoVersionSource) []RepoVersionSource {
 }
 
 func normalizeRepoPreferences(prefs RepoPreferences) RepoPreferences {
+	prefs.BranchScope = normalizeBranchScope(prefs.BranchScope)
 	prefs.SelectedBranches = uniqueStrings(prefs.SelectedBranches)
 	prefs.FavoriteBranches = uniqueStrings(prefs.FavoriteBranches)
 	prefs.BranchTypes = normalizeBranchTypes(prefs.BranchTypes)
@@ -966,6 +1183,14 @@ func normalizeBranchTypes(types map[string]string) map[string]string {
 		clean[name] = normalizedBranchType(branchType)
 	}
 	return clean
+}
+
+func normalizeBranchScope(scope string) string {
+	s := strings.ToLower(strings.TrimSpace(scope))
+	if s == "local" || s == "remote" || s == "all" {
+		return s
+	}
+	return "all"
 }
 
 func sanitizeSourceID(input string) string {

@@ -10,8 +10,8 @@ export function GetAppState() {
   return window['go']['main']['App']['GetAppState']();
 }
 
-export function GetBranchGroupedVersions(arg1, arg2, arg3) {
-  return window['go']['main']['App']['GetBranchGroupedVersions'](arg1, arg2, arg3);
+export function GetBranchGroupedVersions(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['GetBranchGroupedVersions'](arg1, arg2, arg3, arg4, arg5);
 }
 
 export function GetBranchVersions(arg1, arg2) {
@@ -20,6 +20,10 @@ export function GetBranchVersions(arg1, arg2) {
 
 export function GetBranches() {
   return window['go']['main']['App']['GetBranches']();
+}
+
+export function GetBranchesWithMode(arg1) {
+  return window['go']['main']['App']['GetBranchesWithMode'](arg1);
 }
 
 export function GetRepoPath() {

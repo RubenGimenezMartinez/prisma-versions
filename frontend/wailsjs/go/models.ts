@@ -153,6 +153,7 @@ export namespace main {
 	}
 	export class RepoPreferences {
 	    versionFile?: string;
+	    branchScope?: string;
 	    selectedBranches: string[];
 	    favoriteBranches: string[];
 	    branchTypes: Record<string, string>;
@@ -166,6 +167,7 @@ export namespace main {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.versionFile = source["versionFile"];
+	        this.branchScope = source["branchScope"];
 	        this.selectedBranches = source["selectedBranches"];
 	        this.favoriteBranches = source["favoriteBranches"];
 	        this.branchTypes = source["branchTypes"];

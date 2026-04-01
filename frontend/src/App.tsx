@@ -3,7 +3,7 @@ import "./App.css";
 import {
   CreateUser,
   GetAppState,
-  GetBranches,
+  GetBranchesWithMode,
   GetBranchGroupedVersions,
   GetRepoPreferences,
   OpenFolderDialog,
@@ -31,6 +31,7 @@ interface RepoVersionSource {
 }
 
 interface RepoPreferences {
+  branchScope?: string;
   selectedBranches: string[];
   favoriteBranches: string[];
   branchTypes: Record<string, string>;
@@ -71,12 +72,15 @@ function App() {
   const [branchTypes, setBranchTypes] = useState<Record<string, string>>({});
   const [branchSearch, setBranchSearch] = useState("");
   const [branchDropdownOpen, setBranchDropdownOpen] = useState(false);
+  const [branchScope, setBranchScope] = useState("all");
   const [versionSources, setVersionSources] = useState<RepoVersionSource[]>([]);
   const [selectedSourceIds, setSelectedSourceIds] = useState<string[]>([]);
   const [sourceName, setSourceName] = useState("");
   const [sourceFilePath, setSourceFilePath] = useState("");
   const [sourcePattern, setSourcePattern] = useState("");
   const [sourceFavorite, setSourceFavorite] = useState(false);
+  const [disableIncrement, setDisableIncrement] = useState(false);
+  const [incrementBy, setIncrementBy] = useState(1);
   const [previewBranch, setPreviewBranch] = useState("current");
   const [editingSourceId, setEditingSourceId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
@@ -110,12 +114,14 @@ function App() {
 
   const buildPreferencesPayload = useCallback(
     (opts?: {
+      branchScope?: string;
       selectedBranches?: string[];
       favoriteBranches?: string[];
       branchTypes?: Record<string, string>;
       versionSources?: RepoVersionSource[];
       selectedSourceIds?: string[];
     }): RepoPreferences => ({
+      branchScope: opts?.branchScope ?? branchScope,
       selectedBranches: opts?.selectedBranches ?? selectedBranches,
       favoriteBranches: opts?.favoriteBranches ?? favoriteBranches,
       branchTypes: opts?.branchTypes ?? branchTypes,
@@ -126,6 +132,7 @@ function App() {
       selectedBranches,
       favoriteBranches,
       branchTypes,
+      branchScope,
       versionSources,
       selectedSourceIds,
     ],
@@ -134,6 +141,7 @@ function App() {
   const persistRepoPreferences = useCallback(
     async (opts?: {
       path?: string;
+      branchScope?: string;
       selectedBranches?: string[];
       favoriteBranches?: string[];
       branchTypes?: Record<string, string>;
@@ -176,6 +184,14 @@ function App() {
         validSourceIDs.has(id),
       );
 
+      const scope =
+        prefs.branchScope === "local" ||
+        prefs.branchScope === "remote" ||
+        prefs.branchScope === "all"
+          ? prefs.branchScope
+          : "all";
+      setBranchScope(scope);
+
       setSelectedBranches(selected.length > 0 ? selected : [...branchList]);
       setFavoriteBranches(favorites);
       const nextBranchTypes: Record<string, string> = {};
@@ -203,7 +219,7 @@ function App() {
     setRepoPath(state.repoPath ?? "");
     if (state.repoPath) {
       setRepoSet(true);
-      const list = await GetBranches();
+      const list = await GetBranchesWithMode(branchScope);
       setBranches(list ?? []);
       await applyRepoPreferences(state.repoPath, list ?? []);
     } else {
@@ -215,7 +231,7 @@ function App() {
       setVersionSources([]);
       setSelectedSourceIds([]);
     }
-  }, [applyRepoPreferences]);
+  }, [applyRepoPreferences, branchScope]);
 
   useEffect(() => {
     loadState().catch((e: unknown) => setError(String(e)));
@@ -275,7 +291,7 @@ function App() {
     try {
       await SetRepoPath(repoPath);
       setRepoSet(true);
-      const list = await GetBranches();
+      const list = await GetBranchesWithMode(branchScope);
       setBranches(list ?? []);
       await applyRepoPreferences(repoPath, list ?? []);
       setOutputText("");
@@ -294,7 +310,7 @@ function App() {
       try {
         await SetRepoPath(path);
         setRepoSet(true);
-        const list = await GetBranches();
+        const list = await GetBranchesWithMode(branchScope);
         setBranches(list ?? []);
         await applyRepoPreferences(path, list ?? []);
         setOutputText("");
@@ -302,7 +318,7 @@ function App() {
         setError(String(e));
       }
     },
-    [applyRepoPreferences],
+    [applyRepoPreferences, branchScope],
   );
 
   const handleRemoveSavedRepo = useCallback(async (path: string) => {
@@ -525,18 +541,47 @@ function App() {
         selectedSources,
         selectedBranches,
         branchTypes,
+        incrementBy,
+        !disableIncrement,
+      );
+
+      const sourceMap = new Map(
+        selectedSources.map((source) => [source.id, source]),
       );
 
       const text = grouped
         .map((branchGroup) => {
-          if (selectedSources.length === 1) {
-            const value = branchGroup.items[0]?.value ?? "no-version";
-            return `${branchGroup.branch}: ${value}`;
+          const lines = [
+            `Branch: ${branchGroup.branch}`,
+            "----------------------------------------",
+          ];
+
+          for (const item of branchGroup.items) {
+            const source = sourceMap.get(item.sourceId);
+            const sourceTitle = source
+              ? `${item.name} (${source.filePath})`
+              : item.name;
+            lines.push(`Source: ${sourceTitle}`);
+
+            const valueLines = (item.value || "no-version")
+              .split("\n")
+              .map((line) => line.trim())
+              .filter((line) => line.length > 0);
+
+            if (valueLines.length === 0) {
+              lines.push("  - no-version");
+            } else {
+              for (const valueLine of valueLines) {
+                lines.push(`  - ${valueLine}`);
+              }
+            }
+            lines.push("");
           }
-          const lines = branchGroup.items.map(
-            (item) => `  ${item.name}: ${item.value}`,
-          );
-          return [`${branchGroup.branch}:`, ...lines].join("\n");
+
+          if (lines[lines.length - 1] === "") {
+            lines.pop();
+          }
+          return lines.join("\n");
         })
         .join("\n\n");
 
@@ -549,6 +594,8 @@ function App() {
     }
   }, [
     branchTypes,
+    disableIncrement,
+    incrementBy,
     selectedBranches,
     selectedSourceIds,
     versionSources,
@@ -688,6 +735,24 @@ function App() {
             <p className="hint">
               Choose which branches to include and mark favorites.
             </p>
+
+            <div className="input-row">
+              <select
+                className="text-input"
+                value={branchScope}
+                onChange={(e) => {
+                  const scope = e.target.value;
+                  setBranchScope(scope);
+                  persistRepoPreferences({ branchScope: scope }).catch(
+                    (err: unknown) => setError(String(err)),
+                  );
+                }}
+              >
+                <option value="all">Local + Remote</option>
+                <option value="local">Only Local</option>
+                <option value="remote">Only Remote</option>
+              </select>
+            </div>
 
             {favoriteBranches.length > 0 && (
               <div className="favorite-branches">
@@ -1040,6 +1105,31 @@ function App() {
         {repoSet && (
           <section className="card">
             <div className="input-row">
+              <label className="source-favorite-check">
+                <input
+                  type="checkbox"
+                  checked={disableIncrement}
+                  onChange={(e) => setDisableIncrement(e.target.checked)}
+                />
+                No incrementar version
+              </label>
+              <input
+                type="number"
+                className="text-input"
+                min={1}
+                step={1}
+                disabled={disableIncrement}
+                value={incrementBy}
+                onChange={(e) => {
+                  const value = Number.parseInt(e.target.value, 10);
+                  if (Number.isNaN(value) || value < 1) {
+                    setIncrementBy(1);
+                    return;
+                  }
+                  setIncrementBy(value);
+                }}
+                title="Increment step"
+              />
               <button
                 onClick={handleGetVersions}
                 className="btn btn-primary"

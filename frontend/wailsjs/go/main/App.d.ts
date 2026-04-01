@@ -6,11 +6,13 @@ export function CreateUser(arg1:string):Promise<void>;
 
 export function GetAppState():Promise<main.AppState>;
 
-export function GetBranchGroupedVersions(arg1:Array<main.RepoVersionSource>,arg2:Array<string>,arg3:Record<string, string>):Promise<Array<main.BranchGroupedResult>>;
+export function GetBranchGroupedVersions(arg1:Array<main.RepoVersionSource>,arg2:Array<string>,arg3:Record<string, string>,arg4:number,arg5:boolean):Promise<Array<main.BranchGroupedResult>>;
 
 export function GetBranchVersions(arg1:string,arg2:Array<string>):Promise<Array<main.BranchVersion>>;
 
 export function GetBranches():Promise<Array<string>>;
+
+export function GetBranchesWithMode(arg1:string):Promise<Array<string>>;
 
 export function GetRepoPath():Promise<string>;
 
